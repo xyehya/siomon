@@ -134,6 +134,10 @@ sudo sio
 | Key | Action |
 |-----|--------|
 | `q` / `Esc` | Quit (or clear active filter if one is set) |
+| `d` | Toggle dashboard / tree view |
+| `p` | CPU detail view (per-core clocks, VID, thermals, throttling) |
+| `m` | DIMM detail view |
+| `t` | Cycle color theme |
 | `/` | Enter search/filter mode |
 | `Up` / `Down` / `j` / `k` | Navigate between groups |
 | `Enter` / `Space` | Toggle collapse/expand group |
