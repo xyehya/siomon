@@ -235,6 +235,16 @@ fn discover_all_sources(
             Box::new(src)
         });
 
+        // Moderate: opens one MSR device per CPU and takes a counter baseline
+        let h_msr = s.spawn(|| -> Box<dyn SensorSource> {
+            Box::new(super::intel_msr::IntelMsrSource::discover())
+        });
+
+        // Moderate: opens uncore perf counters and takes a baseline
+        let h_uncore = s.spawn(|| -> Box<dyn SensorSource> {
+            Box::new(super::intel_uncore::IntelUncoreSource::discover())
+        });
+
         // Moderate: hwmon sysfs enumeration
         let h_hwmon = s.spawn(|| -> Box<dyn SensorSource> {
             let src = hwmon::HwmonSource::discover(label_overrides, voltage_scaling);
@@ -275,6 +285,11 @@ fn discover_all_sources(
                     );
                 }
 
+                // Intel MCHBAR MMIO (host-bridge gated inside)
+                dio_sources.push(Box::new(
+                    crate::sensors::intel_mchbar::IntelMchbarSource::discover(),
+                ));
+
                 let buses = crate::sensors::i2c::bus_scan::enumerate_smbus_adapters();
                 dio_sources.push(Box::new(
                     crate::sensors::i2c::spd5118::Spd5118Source::discover(board, &buses),
@@ -311,6 +326,7 @@ fn discover_all_sources(
             Box::new(super::aer::AerSource::discover()),
             Box::new(super::mce::MceSource::discover()),
             Box::new(super::memory_util::MemoryUtilSource::discover()),
+            Box::new(super::intel_gpu::IntelGpuSource::discover()),
         ];
 
         // Tegra platform sources (devfreq GPU, hardware engines)
@@ -326,6 +342,8 @@ fn discover_all_sources(
         result.extend(join_or_log(h_hwmon.join(), "hwmon"));
         result.extend(join_or_log(h_gpu.join(), "gpu"));
         result.extend(join_or_log(h_hsmp.join(), "hsmp"));
+        result.extend(join_or_log(h_msr.join(), "intel_msr"));
+        result.extend(join_or_log(h_uncore.join(), "intel_uncore"));
         result.extend(join_or_log(h_ipmi.join(), "ipmi"));
 
         if let Some(h) = h_direct_io

@@ -956,12 +956,17 @@ fn build_rows(
             .map(|buf| sparkline_str(buf, 20))
             .unwrap_or_default();
 
+        // Min/max/avg of a bitmask are not meaningful; show only the word.
+        let stat = |v: f64| match reading.unit {
+            SensorUnit::Bitmask => String::new(),
+            _ => format!("{:.prec$}", v, prec = precision),
+        };
         let row = Row::new(vec![
             Cell::from(label_text),
-            Cell::from(format!("{:.prec$}", reading.current, prec = precision)).style(style),
-            Cell::from(format!("{:.prec$}", reading.min, prec = precision)),
-            Cell::from(format!("{:.prec$}", reading.max, prec = precision)),
-            Cell::from(format!("{:.prec$}", reading.avg, prec = precision)),
+            Cell::from(reading.unit.format_value(reading.current)).style(style),
+            Cell::from(stat(reading.min)),
+            Cell::from(stat(reading.max)),
+            Cell::from(stat(reading.avg)),
             Cell::from(format!("{}", reading.unit)),
             Cell::from(spark).style(theme.muted_style()),
         ]);
@@ -1180,21 +1185,7 @@ fn render_status_bar(
 }
 
 pub(crate) fn format_precision(unit: &SensorUnit) -> usize {
-    match unit {
-        SensorUnit::Celsius
-        | SensorUnit::Volts
-        | SensorUnit::Millivolts
-        | SensorUnit::Watts
-        | SensorUnit::Milliwatts
-        | SensorUnit::Amps
-        | SensorUnit::Milliamps => 1,
-        SensorUnit::Rpm | SensorUnit::Mhz | SensorUnit::Percent => 0,
-        SensorUnit::BytesPerSec
-        | SensorUnit::MegabytesPerSec
-        | SensorUnit::Bytes
-        | SensorUnit::Megabytes => 1,
-        SensorUnit::Unitless => 1,
-    }
+    unit.display_precision()
 }
 
 fn format_elapsed(d: Duration) -> String {

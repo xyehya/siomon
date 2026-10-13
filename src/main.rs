@@ -5,6 +5,7 @@ use chrono::Utc;
 use clap::{CommandFactory, FromArgMatches};
 
 use siomon::cli::{Cli, Commands, OutputFormat};
+use siomon::model::sensor::SensorUnit;
 use siomon::model::system::SystemInfo;
 use siomon::{collectors, config, db, output, platform, sensors};
 
@@ -238,10 +239,15 @@ fn run_sensor_snapshot(
                 println!("── {} ──", chip_key);
                 last_chip = chip_key;
             }
-            println!(
-                "  {:<35} {:>10.1} {}",
-                reading.label, reading.current, reading.unit
-            );
+            let value = match reading.unit {
+                SensorUnit::Bitmask => reading.unit.format_value(reading.current),
+                _ => format!(
+                    "{:.*}",
+                    reading.unit.display_precision().max(1),
+                    reading.current
+                ),
+            };
+            println!("  {:<35} {:>10} {}", reading.label, value, reading.unit);
         }
     }
 }

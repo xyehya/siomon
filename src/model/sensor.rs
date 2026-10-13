@@ -172,6 +172,8 @@ pub enum SensorUnit {
     Bytes,
     Megabytes,
     Unitless,
+    /// Raw register status or flag bits, displayed in hexadecimal.
+    Bitmask,
 }
 
 impl std::fmt::Display for SensorUnit {
@@ -191,7 +193,38 @@ impl std::fmt::Display for SensorUnit {
             Self::MegabytesPerSec => write!(f, "MB/s"),
             Self::Bytes => write!(f, "B"),
             Self::Megabytes => write!(f, "MB"),
-            Self::Unitless => write!(f, ""),
+            Self::Unitless | Self::Bitmask => write!(f, ""),
+        }
+    }
+}
+
+impl SensorUnit {
+    /// Decimal places used when displaying a value in this unit.
+    ///
+    /// Volts get millivolt resolution: CPU VID requests and rail senses step
+    /// in 1-16 mV increments, which one decimal place would hide.
+    pub fn display_precision(&self) -> usize {
+        match self {
+            Self::Volts => 3,
+            Self::Celsius
+            | Self::Millivolts
+            | Self::Watts
+            | Self::Milliwatts
+            | Self::Amps
+            | Self::Milliamps => 1,
+            Self::Rpm | Self::Mhz | Self::Percent => 0,
+            Self::BytesPerSec | Self::MegabytesPerSec | Self::Bytes | Self::Megabytes => 1,
+            Self::Unitless => 1,
+            Self::Bitmask => 0,
+        }
+    }
+
+    /// Format `value` for display in this unit: hexadecimal for bitmasks,
+    /// otherwise fixed-point at [`display_precision`](Self::display_precision).
+    pub fn format_value(&self, value: f64) -> String {
+        match self {
+            Self::Bitmask => format!("{:#06x}", value as u64),
+            _ => format!("{:.*}", self.display_precision(), value),
         }
     }
 }
@@ -292,5 +325,22 @@ mod tests {
         assert_eq!(format!("{}", SensorUnit::Watts), "W");
         assert_eq!(format!("{}", SensorUnit::Rpm), "RPM");
         assert_eq!(format!("{}", SensorUnit::Percent), "%");
+    }
+
+    #[test]
+    fn test_display_precision_volts_is_millivolt() {
+        assert_eq!(SensorUnit::Volts.display_precision(), 3);
+        assert_eq!(SensorUnit::Celsius.display_precision(), 1);
+        assert_eq!(SensorUnit::Mhz.display_precision(), 0);
+    }
+
+    #[test]
+    fn test_format_value_bitmask_is_hex() {
+        assert_eq!(SensorUnit::Bitmask.format_value(8192.0), "0x2000");
+        assert_eq!(
+            SensorUnit::Bitmask.format_value(297_926_656.0),
+            "0x11c20000"
+        );
+        assert_eq!(SensorUnit::Volts.format_value(1.2162), "1.216");
     }
 }
