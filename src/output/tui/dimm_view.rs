@@ -66,11 +66,19 @@ pub fn render(
 
         // Main content area: DIMM table, then the trained controller panel
         let controller = controller_lines(memory_info.controller.as_ref(), theme);
+        // Size the table to its rows (header + borders) so the controller
+        // panel sits right under it.
+        let table_height = if memory_info.dimms.is_empty() {
+            1
+        } else {
+            memory_info.dimms.len() as u16 + 3
+        };
         let split = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(3),
+                Constraint::Length(table_height),
                 Constraint::Length(controller.len() as u16 + 2),
+                Constraint::Min(0),
             ])
             .split(outer[1]);
         let main_area = split[0];
@@ -327,7 +335,7 @@ fn controller_lines<'a>(mc: Option<&MemoryControllerInfo>, theme: &TuiTheme) -> 
         for (label, value) in fields {
             spans.push(Span::styled(format!("{label} "), theme.muted_style()));
             spans.push(Span::styled(
-                format!("{value:<7}"),
+                format!("{value:<5}  "),
                 Style::default().fg(Color::Cyan),
             ));
         }
