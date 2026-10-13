@@ -237,6 +237,19 @@ struct Panel<'a> {
     lines: Vec<Line<'a>>,
 }
 
+/// Explain missing uncore perf readings when the PMU exists: either no
+/// permission, or another perf session (e.g. `perf stat`, turbostat) holds
+/// the counters, in which case readings are skipped rather than estimated.
+fn uncore_hint<'a>(idx: &Index, prefix: &str, pmu: &str, theme: &TuiTheme) -> Option<Line<'a>> {
+    let present = idx.map.keys().any(|k| k.starts_with(prefix));
+    (!present && crate::platform::perf::pmu_exists(pmu)).then(|| {
+        Line::from(Span::styled(
+            "uncore counters unavailable: needs root, or in use by another perf session",
+            theme.muted_style(),
+        ))
+    })
+}
+
 fn clocks_panel<'a>(idx: &Index, rows: &[CoreRow], theme: &TuiTheme) -> Panel<'a> {
     let mut lines = Vec::new();
     let freq = theme.info_style();
@@ -274,6 +287,7 @@ fn clocks_panel<'a>(idx: &Index, rows: &[CoreRow], theme: &TuiTheme) -> Panel<'a
             lines.push(kv(theme, label, format!("{v:.0} MHz"), freq));
         }
     }
+    lines.extend(uncore_hint(idx, "uncore/clocks/", "uncore_cncu", theme));
     for (key, label) in [
         ("mchbar/arl/bclk", "BCLK"),
         ("mchbar/arl/soc_bclk", "SoC BCLK"),
@@ -525,6 +539,11 @@ fn memory_panel<'a>(idx: &Index, memory: &MemoryInfo, theme: &TuiTheme) -> Panel
         if let Some(v) = idx.value(key) {
             lines.push(kv(theme, label, format!("{v:.0} MB/s"), theme.good_style()));
         }
+    }
+    // DRAM bandwidth is only measured on Arrow Lake-S, where MCHBAR also
+    // provides the trained timings; hint only there.
+    if memory.controller.is_some() {
+        lines.extend(uncore_hint(idx, "uncore/imc/", "uncore_imc_0", theme));
     }
     Panel {
         title: "Memory",
