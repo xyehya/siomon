@@ -143,15 +143,22 @@ mod inner {
     pub(super) struct ClockStats {
         /// Average clock including idle time (ΔAPERF / Δt).
         pub effective_mhz: f64,
-        /// C0 residency (ΔMPERF / ΔTSC).
+        /// C0 residency (ΔMPERF over the MPERF ticks of the interval).
         pub busy_pct: f64,
-        /// Average clock while in C0 (TSC rate × ΔAPERF / ΔMPERF).
+        /// Average clock while in C0 (MPERF rate × ΔAPERF / ΔMPERF).
         pub busy_mhz: Option<f64>,
     }
 
-    /// Derive interval clocks. Returns `None` when a counter went backwards
-    /// (CPU hotplug, resume) or no time elapsed.
-    pub(super) fn clock_stats(prev: &Counters, cur: &Counters) -> Option<ClockStats> {
+    /// Derive interval clocks. `mperf_mhz` is the rate MPERF ticks at in
+    /// C0, the base (P1) clock from CPUID leaf 0x16. It can differ from the
+    /// TSC rate (Arrow Lake: 3700 vs 3686.4 MHz), so the TSC rate is only a
+    /// fallback. Returns `None` when a counter went backwards (CPU hotplug,
+    /// resume) or no time elapsed.
+    pub(super) fn clock_stats(
+        prev: &Counters,
+        cur: &Counters,
+        mperf_mhz: Option<f64>,
+    ) -> Option<ClockStats> {
         let secs = cur.at.checked_duration_since(prev.at)?.as_secs_f64();
         let d_tsc = cur.tsc.checked_sub(prev.tsc)?;
         let d_aperf = cur.aperf.checked_sub(prev.aperf)?;
@@ -159,12 +166,22 @@ mod inner {
         if secs <= 0.0 || d_tsc == 0 {
             return None;
         }
-        let tsc_mhz = d_tsc as f64 / secs / 1e6;
+        let ref_mhz = mperf_mhz.unwrap_or(d_tsc as f64 / secs / 1e6);
+        let ref_ticks = ref_mhz * 1e6 * secs;
         Some(ClockStats {
             effective_mhz: d_aperf as f64 / secs / 1e6,
-            busy_pct: (d_mperf as f64 / d_tsc as f64 * 100.0).min(100.0),
-            busy_mhz: (d_mperf > 0).then(|| tsc_mhz * d_aperf as f64 / d_mperf as f64),
+            busy_pct: (d_mperf as f64 / ref_ticks * 100.0).min(100.0),
+            busy_mhz: (d_mperf > 0).then(|| ref_mhz * d_aperf as f64 / d_mperf as f64),
         })
+    }
+
+    /// Base (MPERF) clock in MHz from CPUID leaf 0x16, if reported.
+    fn mperf_mhz() -> Option<f64> {
+        raw_cpuid::CpuId::new()
+            .get_processor_frequency_info()
+            .map(|f| f.processor_base_frequency())
+            .filter(|&mhz| mhz != 0)
+            .map(f64::from)
     }
 
     // ── Source ──────────────────────────────────────────────────────────
@@ -204,6 +221,7 @@ mod inner {
         packages: Vec<PackageEntry>,
         features: ModelFeatures,
         aperfmperf: bool,
+        mperf_mhz: Option<f64>,
     }
 
     impl IntelMsrSource {
@@ -213,6 +231,7 @@ mod inner {
                 packages: Vec::new(),
                 features: ModelFeatures::default(),
                 aperfmperf: false,
+                mperf_mhz: None,
             };
 
             let cpuinfo = crate::platform::procfs::parse_cpuinfo();
@@ -297,13 +316,19 @@ mod inner {
                 packages,
                 features,
                 aperfmperf,
+                mperf_mhz: mperf_mhz(),
             }
         }
 
         pub fn poll(&mut self) -> Vec<(SensorId, SensorReading)> {
             let mut readings = Vec::new();
             for entry in &mut self.cpus {
-                poll_cpu(entry, self.features, self.aperfmperf, &mut readings);
+                poll_cpu(
+                    entry,
+                    self.features,
+                    self.aperfmperf.then_some(self.mperf_mhz),
+                    &mut readings,
+                );
             }
             for pkg in &mut self.packages {
                 poll_package(pkg, self.features, &mut readings);
@@ -335,17 +360,25 @@ mod inner {
         })
     }
 
+    /// `aperfmperf` is `None` when the CPU lacks APERF/MPERF, otherwise the
+    /// MPERF base clock if known.
     fn poll_cpu(
         entry: &mut CpuEntry,
         features: ModelFeatures,
-        aperfmperf: bool,
+        aperfmperf: Option<Option<f64>>,
         out: &mut Vec<(SensorId, SensorReading)>,
     ) {
         let cpu = entry.cpu;
         let prefix = &entry.prefix;
 
-        if aperfmperf && let Some(cur) = read_counters(&entry.dev) {
-            if let Some(stats) = entry.prev.as_ref().and_then(|p| clock_stats(p, &cur)) {
+        if let Some(mperf_mhz) = aperfmperf
+            && let Some(cur) = read_counters(&entry.dev)
+        {
+            if let Some(stats) = entry
+                .prev
+                .as_ref()
+                .and_then(|p| clock_stats(p, &cur, mperf_mhz))
+            {
                 out.push(reading(
                     "eff_clock",
                     cpu,
@@ -720,15 +753,47 @@ mod tests {
             mperf: 0,
             at: t0,
         };
-        // 1 s at a 3700 MHz TSC, 25% in C0 at 5000 MHz
+        // 1 s with MPERF at a 3700 MHz base and the TSC at 3686.4 MHz
+        // (Arrow Lake); 25% in C0 at 5000 MHz
+        let cur = Counters {
+            tsc: 3_686_400_000,
+            aperf: 1_250_000_000,
+            mperf: 925_000_000,
+            at: t0 + Duration::from_secs(1),
+        };
+        let s = clock_stats(&prev, &cur, Some(3700.0)).unwrap();
+        assert!((s.effective_mhz - 1250.0).abs() < 0.01);
+        assert!((s.busy_pct - 25.0).abs() < 0.01);
+        assert!((s.busy_mhz.unwrap() - 5000.0).abs() < 0.01);
+
+        // Fully busy: busy clock equals effective clock
+        let busy = Counters {
+            tsc: 3_686_400_000,
+            aperf: 5_500_000_000,
+            mperf: 3_700_000_000,
+            at: t0 + Duration::from_secs(1),
+        };
+        let s = clock_stats(&prev, &busy, Some(3700.0)).unwrap();
+        assert!((s.busy_mhz.unwrap() - s.effective_mhz).abs() < 0.01);
+        assert!((s.busy_pct - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_clock_stats_tsc_fallback() {
+        let t0 = Instant::now();
+        let prev = Counters {
+            tsc: 0,
+            aperf: 0,
+            mperf: 0,
+            at: t0,
+        };
         let cur = Counters {
             tsc: 3_700_000_000,
             aperf: 1_250_000_000,
             mperf: 925_000_000,
             at: t0 + Duration::from_secs(1),
         };
-        let s = clock_stats(&prev, &cur).unwrap();
-        assert!((s.effective_mhz - 1250.0).abs() < 0.01);
+        let s = clock_stats(&prev, &cur, None).unwrap();
         assert!((s.busy_pct - 25.0).abs() < 0.01);
         assert!((s.busy_mhz.unwrap() - 5000.0).abs() < 0.01);
     }
@@ -748,7 +813,7 @@ mod tests {
             mperf: 200,
             at: t0 + Duration::from_secs(1),
         };
-        assert!(clock_stats(&prev, &cur).is_none());
+        assert!(clock_stats(&prev, &cur, Some(3700.0)).is_none());
     }
 
     #[test]
@@ -766,7 +831,7 @@ mod tests {
             mperf: 0,
             at: t0 + Duration::from_millis(10),
         };
-        let s = clock_stats(&prev, &cur).unwrap();
+        let s = clock_stats(&prev, &cur, Some(3700.0)).unwrap();
         assert_eq!(s.busy_pct, 0.0);
         assert_eq!(s.busy_mhz, None);
     }
