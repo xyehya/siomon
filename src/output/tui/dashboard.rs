@@ -131,7 +131,7 @@ pub fn render(
 
         // Status bar
         let status = Paragraph::new(format!(
-            " q: quit | d: tree view | m: DIMM | t: theme | /: search | {sensor_count} sensors | {elapsed_str}"
+            " q: quit | d: tree view | p: CPU | m: DIMM | t: theme | /: search | {sensor_count} sensors | {elapsed_str}"
         ))
         .style(theme.status_style());
         frame.render_widget(status, outer[2]);
@@ -640,6 +640,46 @@ fn build_cpu_panel<'a>(
         rows.push(PanelRow::Text(Line::from(spans)));
     }
 
+    // Intel MSR per-core summaries: average effective clock, highest VID
+    for (chip, label, unit, use_max) in [
+        ("eff_clock", "Eff clock", "MHz", false),
+        ("vid", "VID max", "V", true),
+    ] {
+        let mut by_kind: Vec<String> = Vec::new();
+        for prefix in ["P-Core", "E-Core", "Core"] {
+            let vals: Vec<f64> = snapshot
+                .iter()
+                .filter(|(id, r)| {
+                    id.source == "cpu" && id.chip == chip && r.label.starts_with(prefix)
+                })
+                .map(|(_, r)| r.current)
+                .collect();
+            if vals.is_empty() {
+                continue;
+            }
+            let v = if use_max {
+                vals.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+            } else {
+                vals.iter().sum::<f64>() / vals.len() as f64
+            };
+            let tag = prefix.trim_end_matches("-Core").trim_end_matches("Core");
+            let prec = if use_max { 3 } else { 0 };
+            by_kind.push(format!(
+                "{tag}{}{v:.prec$}",
+                if tag.is_empty() { "" } else { " " }
+            ));
+        }
+        if !by_kind.is_empty() {
+            rows.push(PanelRow::Text(Line::from(vec![
+                Span::styled(format!("{label}: "), theme.label_style()),
+                Span::styled(
+                    format!("{} {unit}", by_kind.join(" / ")),
+                    theme.info_style(),
+                ),
+            ])));
+        }
+    }
+
     Some(Panel {
         title: "CPU".into(),
         headline,
@@ -816,6 +856,24 @@ fn build_memory_panel<'a>(
         ])));
     }
 
+    // DRAM bandwidth from the uncore IMC counters
+    for (_, r) in ["dram_read", "dram_write", "dram_total"]
+        .iter()
+        .filter_map(|s| {
+            snapshot
+                .iter()
+                .find(|(id, _)| id.source == "uncore" && id.chip == "imc" && id.sensor == *s)
+        })
+    {
+        rows.push(PanelRow::Text(Line::from(vec![
+            Span::styled(
+                format!("{:<20} ", truncate_label(&r.label, 20)),
+                theme.label_style(),
+            ),
+            Span::styled(format!("{:>7.0} MB/s", r.current), theme.info_style()),
+        ])));
+    }
+
     // RAPL sub-domains (core, uncore, dram — package is in the CPU panel)
     for (_, r) in snapshot.iter().filter(|(id, _)| {
         id.source == "cpu" && id.chip == "rapl" && !id.sensor.starts_with("package")
@@ -857,7 +915,8 @@ fn build_power_panel<'a>(
     let mut power: Vec<&(SensorId, SensorReading)> = snapshot
         .iter()
         .filter(|(id, r)| {
-            r.category == SensorCategory::Power && !(id.source == "cpu" && id.chip == "rapl")
+            r.category == SensorCategory::Power
+                && !(id.source == "cpu" && (id.chip == "rapl" || id.chip == "rapl_limits"))
         })
         .collect();
 
@@ -1121,6 +1180,25 @@ fn build_fans_panel<'a>(
 // Platform (HSMP) Panel
 // ---------------------------------------------------------------------------
 
+/// Intel package-level readings shown in the Platform panel (the full set
+/// is in the CPU view).
+const INTEL_PLATFORM_SENSORS: &[&str] = &[
+    "cpu/package0/uncore_vid",
+    "cpu/package0/ring_ratio",
+    "uncore/clocks/ring_clock",
+    "uncore/clocks/sncu_clock",
+    "mchbar/arl/sa_vid",
+    "mchbar/arl/bclk",
+    "cpu/rapl_limits/package-0-pl1",
+    "cpu/rapl_limits/package-0-pl2",
+    "cpu/package0/c2_residency",
+];
+
+fn is_intel_platform_sensor(id: &SensorId) -> bool {
+    let key = id.to_string();
+    INTEL_PLATFORM_SENSORS.contains(&key.as_str())
+}
+
 fn build_platform_panel<'a>(
     snapshot: &'a [(SensorId, SensorReading)],
     max_entries: usize,
@@ -1129,7 +1207,9 @@ fn build_platform_panel<'a>(
     // DDR bandwidth and memory clock are shown in the Memory panel.
     let hsmp: Vec<&(SensorId, SensorReading)> = snapshot
         .iter()
-        .filter(|(id, _)| id.source == "hsmp" && !is_hsmp_memory_sensor(id))
+        .filter(|(id, _)| {
+            (id.source == "hsmp" && !is_hsmp_memory_sensor(id)) || is_intel_platform_sensor(id)
+        })
         .collect();
 
     if hsmp.is_empty() {
@@ -1248,9 +1328,13 @@ fn build_voltage_panel<'a>(
     max_entries: usize,
     theme: &TuiTheme,
 ) -> Option<Panel<'a>> {
+    // Per-core VID requests would crowd out the board rails; the CPU panel
+    // shows their maxima and the CPU view lists them all.
     let mut volts: Vec<&(SensorId, SensorReading)> = snapshot
         .iter()
-        .filter(|(_, r)| r.category == SensorCategory::Voltage)
+        .filter(|(id, r)| {
+            r.category == SensorCategory::Voltage && !(id.source == "cpu" && id.chip == "vid")
+        })
         .collect();
 
     if volts.is_empty() {
@@ -1307,7 +1391,7 @@ fn build_gpu_panel<'a>(
 ) -> Option<Panel<'a>> {
     let gpu_sensors: Vec<&(SensorId, SensorReading)> = snapshot
         .iter()
-        .filter(|(id, _)| id.source == "nvml" || id.source == "amdgpu")
+        .filter(|(id, _)| id.source == "nvml" || id.source == "amdgpu" || id.source == "igpu")
         .collect();
 
     if gpu_sensors.is_empty() {
@@ -1332,7 +1416,11 @@ fn build_gpu_panel<'a>(
                 "vram_used" => "VRAM Used",
                 other => other,
             };
-            let label = format!("GPU{gpu_idx} {sensor_name}");
+            let label = if id.source == "igpu" {
+                truncate_label(&r.label, 20)
+            } else {
+                format!("GPU{gpu_idx} {sensor_name}")
+            };
             let key = format!("{}/{}/{}", id.source, id.chip, id.sensor);
             // Use uniform color for all GPU sparklines to avoid rainbow effect
             let spark_spans = history

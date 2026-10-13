@@ -53,7 +53,7 @@ pub fn render(
         frame.render_widget(header, outer[0]);
 
         // Status bar
-        let status = Paragraph::new(" q: quit | d: dashboard | /: search | m: this view")
+        let status = Paragraph::new(" q: quit | d: dashboard | p: CPU | /: search | m: this view")
             .style(theme.status_style());
         frame.render_widget(status, outer[2]);
 
