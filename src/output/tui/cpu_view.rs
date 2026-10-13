@@ -282,22 +282,27 @@ fn clocks_panel<'a>(idx: &Index, rows: &[CoreRow], theme: &TuiTheme) -> Panel<'a
             lines.push(kv(theme, label, format!("{v:.3} MHz"), freq));
         }
     }
-    for gt in ["card0-gt0", "card1-gt0", "card0-gt1", "card1-gt1"] {
-        let clock = idx.get(&format!("igpu/{gt}/act_freq"));
-        let rc6 = idx.value(&format!("igpu/{gt}/rc6"));
-        if clock.is_none() && rc6.is_none() {
+    let mut gts: Vec<&str> = idx
+        .map
+        .keys()
+        .filter_map(|k| k.strip_prefix("intel_gpu/")?.strip_suffix("/act_freq"))
+        .collect();
+    gts.sort_unstable();
+    for gt in gts {
+        let Some(clock) = idx.get(&format!("intel_gpu/{gt}/act_freq")) else {
             continue;
-        }
-        let name = if gt.ends_with("gt1") {
-            "iGPU media"
-        } else {
-            "iGPU render"
         };
-        let clock = clock
-            .map(|r| format!("{:.0} MHz", r.current))
-            .unwrap_or_else(|| "gated".into());
-        let rc6 = rc6.map(|p| format!("  RC6 {p:.0}%")).unwrap_or_default();
-        lines.push(kv(theme, name, format!("{clock}{rc6}"), freq));
+        let name = clock.label.trim_end_matches(" Clock");
+        let value = if clock.current == 0.0 {
+            "gated".to_string()
+        } else {
+            format!("{:.0} MHz", clock.current)
+        };
+        let rc6 = idx
+            .value(&format!("intel_gpu/{gt}/rc6"))
+            .map(|p| format!("  RC6 {p:.0}%"))
+            .unwrap_or_default();
+        lines.push(kv(theme, name, format!("{value}{rc6}"), freq));
     }
     Panel {
         title: "Clocks",
@@ -557,15 +562,11 @@ fn limits_panel<'a>(idx: &Index, theme: &TuiTheme) -> Panel<'a> {
     }
     if !lines.is_empty() {
         lines.push(Line::from(Span::styled(
-            "Raw bits; names are unofficial on this CPU.",
+            "Raw bits: names differ between generations.",
             theme.muted_style(),
         )));
         lines.push(Line::from(Span::styled(
-            "IA bit 12 (turbo ceiling) toggles at idle;",
-            theme.muted_style(),
-        )));
-        lines.push(Line::from(Span::styled(
-            "Ring bit 24 behaves as live, not as a log.",
+            "One sample can catch a bit that flickers.",
             theme.muted_style(),
         )));
     }

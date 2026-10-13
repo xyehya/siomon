@@ -942,11 +942,10 @@ fn build_power_panel<'a>(
                 .get(&key)
                 .map(|buf| sparkline_spans(buf, spark_width, r.category, theme))
                 .unwrap_or_default();
-            let prec = format_precision(&r.unit);
             let mut spans = vec![
                 Span::styled(format!("{label:<20} "), theme.label_style()),
                 Span::styled(
-                    format!("{:>7.*}{}", prec, r.current, r.unit),
+                    format!("{:>7}{}", r.unit.format_value(r.current), r.unit),
                     theme.power_style(),
                 ),
                 Span::raw(" "),
@@ -1181,22 +1180,26 @@ fn build_fans_panel<'a>(
 // ---------------------------------------------------------------------------
 
 /// Intel package-level readings shown in the Platform panel (the full set
-/// is in the CPU view).
-const INTEL_PLATFORM_SENSORS: &[&str] = &[
-    "cpu/package0/uncore_vid",
-    "cpu/package0/ring_ratio",
-    "uncore/clocks/ring_clock",
-    "uncore/clocks/sncu_clock",
-    "mchbar/arl/sa_vid",
-    "mchbar/arl/bclk",
-    "cpu/rapl_limits/package-0-pl1",
-    "cpu/rapl_limits/package-0-pl2",
-    "cpu/package0/c2_residency",
+/// is in the CPU view): `(source, chip prefix, sensor suffixes)`.
+const INTEL_PLATFORM_SENSORS: &[(&str, &str, &[&str])] = &[
+    (
+        "cpu",
+        "package",
+        &["uncore_vid", "ring_ratio", "c2_residency"],
+    ),
+    ("uncore", "clocks", &["ring_clock", "sncu_clock"]),
+    ("mchbar", "", &["sa_vid", "bclk"]),
+    ("cpu", "rapl_limits", &["-pl1", "-pl2"]),
 ];
 
 fn is_intel_platform_sensor(id: &SensorId) -> bool {
-    let key = id.to_string();
-    INTEL_PLATFORM_SENSORS.contains(&key.as_str())
+    INTEL_PLATFORM_SENSORS
+        .iter()
+        .any(|(source, chip, sensors)| {
+            id.source == *source
+                && id.chip.starts_with(chip)
+                && sensors.iter().any(|s| id.sensor.ends_with(s))
+        })
 }
 
 fn build_platform_panel<'a>(
@@ -1321,6 +1324,12 @@ fn build_cpu_freq_panel<'a>(
 // Voltage Panel (3-col only)
 // ---------------------------------------------------------------------------
 
+/// Requested voltages (VID) from the Intel MSR and MCHBAR sources.
+fn is_vid_request(id: &SensorId) -> bool {
+    (id.source == "cpu" && (id.chip == "vid" || id.sensor == "uncore_vid"))
+        || (id.source == "mchbar" && id.sensor == "sa_vid")
+}
+
 fn build_voltage_panel<'a>(
     snapshot: &'a [(SensorId, SensorReading)],
     history: &'a SensorHistory,
@@ -1328,13 +1337,12 @@ fn build_voltage_panel<'a>(
     max_entries: usize,
     theme: &TuiTheme,
 ) -> Option<Panel<'a>> {
-    // Per-core VID requests would crowd out the board rails; the CPU panel
-    // shows their maxima and the CPU view lists them all.
+    // VID requests are not measured rails and per-core VIDs would crowd
+    // the board rails out; the CPU and Platform panels and the CPU view
+    // show them.
     let mut volts: Vec<&(SensorId, SensorReading)> = snapshot
         .iter()
-        .filter(|(id, r)| {
-            r.category == SensorCategory::Voltage && !(id.source == "cpu" && id.chip == "vid")
-        })
+        .filter(|(id, r)| r.category == SensorCategory::Voltage && !is_vid_request(id))
         .collect();
 
     if volts.is_empty() {
@@ -1389,10 +1397,12 @@ fn build_gpu_panel<'a>(
     max_entries: usize,
     theme: &TuiTheme,
 ) -> Option<Panel<'a>> {
-    let gpu_sensors: Vec<&(SensorId, SensorReading)> = snapshot
+    let mut gpu_sensors: Vec<&(SensorId, SensorReading)> = snapshot
         .iter()
-        .filter(|(id, _)| id.source == "nvml" || id.source == "amdgpu" || id.source == "igpu")
+        .filter(|(id, _)| id.source == "nvml" || id.source == "amdgpu" || id.source == "intel_gpu")
         .collect();
+    // Intel GPU rows go last so they never push discrete GPU rows out.
+    gpu_sensors.sort_by_key(|(id, _)| id.source == "intel_gpu");
 
     if gpu_sensors.is_empty() {
         return None;
@@ -1416,7 +1426,7 @@ fn build_gpu_panel<'a>(
                 "vram_used" => "VRAM Used",
                 other => other,
             };
-            let label = if id.source == "igpu" {
+            let label = if id.source == "intel_gpu" {
                 truncate_label(&r.label, 20)
             } else {
                 format!("GPU{gpu_idx} {sensor_name}")

@@ -7,9 +7,13 @@
 //!   with the GT type taken from `gtidle/name` (`gtM-rc` render, `gtM-mc` media).
 //!
 //! The actual clock is what the GT runs at and the requested clock is what
-//! the driver asked for. Both read 0 while the GT is power-gated; a 0 MHz
-//! clock is not published (RC6 residency already says the GT is idle).
+//! the driver asked for. The actual clock reads 0 while the GT is
+//! power-gated; that is published as is, since the GT really is not
+//! clocked (and a skipped reading would leave the last clock on screen).
 //! RC6 residency is the share of the interval the GT spent power-gated.
+//!
+//! The integrated GPU (PCI `00:02.0`) is labelled "iGPU"; other Intel GPUs
+//! are labelled by card.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -19,7 +23,8 @@ use crate::platform::sysfs::{self, CachedFile};
 
 struct GtEntry {
     chip: String,
-    name: &'static str,
+    /// Display prefix, e.g. "iGPU Render".
+    name: String,
     act_freq: Option<CachedFile>,
     cur_freq: Option<CachedFile>,
     rc6_ms: Option<CachedFile>,
@@ -51,6 +56,16 @@ fn rc6_pct(prev: (u64, Instant), cur: (u64, Instant)) -> Option<f64> {
     (elapsed_ms > 0.0).then(|| (d_ms / elapsed_ms * 100.0).clamp(0.0, 100.0))
 }
 
+/// Label prefix for a card: "iGPU" for the integrated function at
+/// `0000:00:02.0`, otherwise the card name.
+fn device_prefix(pci_addr: Option<&str>, card: &str) -> String {
+    if pci_addr == Some("0000:00:02.0") {
+        "iGPU".into()
+    } else {
+        format!("Intel GPU {card}")
+    }
+}
+
 fn gt_index(path: &Path) -> Option<u32> {
     path.file_name()?.to_str()?.strip_prefix("gt")?.parse().ok()
 }
@@ -70,6 +85,7 @@ impl IntelGpuSource {
             if sysfs::read_u64_optional(&device.join("vendor")) != Some(0x8086) {
                 continue;
             }
+            let prefix = device_prefix(sysfs::read_link_basename(&device).as_deref(), card);
 
             // i915
             for gt in sysfs::glob_paths(&format!("{}/gt/gt[0-9]*", card_path.display())) {
@@ -79,7 +95,7 @@ impl IntelGpuSource {
                 push_gt(
                     &mut gts,
                     format!("{card}-gt{index}"),
-                    i915_gt_name(index),
+                    format!("{prefix} {}", i915_gt_name(index)),
                     gt.join("rps_act_freq_mhz"),
                     gt.join("rps_cur_freq_mhz"),
                     gt.join("rc6_residency_ms"),
@@ -97,7 +113,7 @@ impl IntelGpuSource {
                 push_gt(
                     &mut gts,
                     format!("{card}-gt{index}"),
-                    name,
+                    format!("{prefix} {name}"),
                     gt.join("freq0/act_freq"),
                     gt.join("freq0/cur_freq"),
                     gt.join("gtidle/idle_residency_ms"),
@@ -117,7 +133,7 @@ impl IntelGpuSource {
             let mut push = |sensor: &str, label: String, value: f64, unit, category| {
                 readings.push((
                     SensorId {
-                        source: "igpu".into(),
+                        source: "intel_gpu".into(),
                         chip: gt.chip.clone(),
                         sensor: sensor.into(),
                     },
@@ -125,29 +141,19 @@ impl IntelGpuSource {
                 ));
             };
 
-            if let Some(mhz) = gt
-                .act_freq
-                .as_mut()
-                .and_then(|f| f.read_u64())
-                .filter(|&mhz| mhz != 0)
-            {
+            if let Some(mhz) = gt.act_freq.as_mut().and_then(|f| f.read_u64()) {
                 push(
                     "act_freq",
-                    format!("iGPU {} Clock", gt.name),
+                    format!("{} Clock", gt.name),
                     mhz as f64,
                     SensorUnit::Mhz,
                     SensorCategory::Frequency,
                 );
             }
-            if let Some(mhz) = gt
-                .cur_freq
-                .as_mut()
-                .and_then(|f| f.read_u64())
-                .filter(|&mhz| mhz != 0)
-            {
+            if let Some(mhz) = gt.cur_freq.as_mut().and_then(|f| f.read_u64()) {
                 push(
                     "cur_freq",
-                    format!("iGPU {} Requested Clock", gt.name),
+                    format!("{} Requested Clock", gt.name),
                     mhz as f64,
                     SensorUnit::Mhz,
                     SensorCategory::Frequency,
@@ -156,12 +162,13 @@ impl IntelGpuSource {
             if let Some(ms) = gt.rc6_ms.as_mut().and_then(|f| f.read_u64()) {
                 let now = (ms, Instant::now());
                 if let Some(pct) = gt.prev_rc6.and_then(|prev| rc6_pct(prev, now)) {
+                    // Not Utilization: high RC6 means idle, not busy.
                     push(
                         "rc6",
-                        format!("iGPU {} RC6", gt.name),
+                        format!("{} RC6", gt.name),
                         pct,
                         SensorUnit::Percent,
-                        SensorCategory::Utilization,
+                        SensorCategory::Other,
                     );
                 }
                 gt.prev_rc6 = Some(now);
@@ -174,7 +181,7 @@ impl IntelGpuSource {
 fn push_gt(
     gts: &mut Vec<GtEntry>,
     chip: String,
-    name: &'static str,
+    name: String,
     act: PathBuf,
     cur: PathBuf,
     rc6: PathBuf,
@@ -221,6 +228,16 @@ mod tests {
         assert_eq!(xe_gt_name("gt1-mc"), "Media");
         assert_eq!(i915_gt_name(0), "Render");
         assert_eq!(i915_gt_name(1), "Media");
+    }
+
+    #[test]
+    fn test_device_prefix() {
+        assert_eq!(device_prefix(Some("0000:00:02.0"), "card1"), "iGPU");
+        assert_eq!(
+            device_prefix(Some("0000:03:00.0"), "card2"),
+            "Intel GPU card2"
+        );
+        assert_eq!(device_prefix(None, "card0"), "Intel GPU card0");
     }
 
     #[test]

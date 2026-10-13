@@ -695,6 +695,10 @@ fn compute_summaries(snapshot: &[(SensorId, SensorReading)]) -> HashMap<String, 
     let mut summaries: HashMap<String, Summary> = HashMap::new();
 
     for (id, reading) in snapshot {
+        // Min/max ranges of raw status words are meaningless.
+        if reading.unit == SensorUnit::Bitmask {
+            continue;
+        }
         let sk = id.source.clone();
         let ck = chip_key(id);
         let catk = cat_key(&ck, reading.category);

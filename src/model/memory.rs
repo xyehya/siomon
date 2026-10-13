@@ -37,7 +37,9 @@ pub struct MemoryControllerInfo {
 }
 
 /// Trained DRAM timings in memory clocks. Turnaround timings are
-/// `[same group, different group, same DIMM, different DIMM]`.
+/// `[same group, different group, same DIMM, different DIMM]`. `trc`
+/// (tRAS + tRP) and `twr` (tWTP − tCWL − 8) are derived from the trained
+/// fields; the rest are read directly.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrainedTimings {
     pub tcl: u32,

@@ -10,8 +10,11 @@
 //! [`MsrDevice`](crate::platform::msr::MsrDevice). Reading `/dev/cpu/N/msr`
 //! runs RDMSR on CPU N through an IPI, which wakes that CPU: instantaneous
 //! fields (VID, ratio) of an idle core describe the operating point it wakes
-//! into. Counter-derived values (clocks, residency) are interval averages and
-//! are not skewed by this.
+//! into, and the wakeups add a little C0 time, so on an idle system busy %
+//! reads slightly high and package C-state residency slightly low. To keep
+//! this small, each poll reads four MSRs per CPU (APERF, MPERF, PERF_STATUS,
+//! THERM_STATUS) plus a few per package; configuration registers are read
+//! once at startup.
 //!
 //! VID values are the CPU's *requested* voltage (SVID request), not a
 //! measured rail. Board-sensed Vcore comes from the Super I/O via hwmon.
@@ -102,6 +105,13 @@ mod inner {
         (bits(therm_status, 31, 31) == 1).then(|| bits(therm_status, 22, 16))
     }
 
+    /// Degrees below TjMAX from `IA32_PACKAGE_THERM_STATUS[22:16]`. Unlike
+    /// the per-core register, bit 31 is reserved here (no valid bit), so the
+    /// readout is taken as is, as coretemp does.
+    pub(super) fn package_distance_to_tjmax(pkg_therm_status: u64) -> u64 {
+        bits(pkg_therm_status, 22, 16)
+    }
+
     /// Status and sticky log flags (bits 15:0) of a thermal status word,
     /// displayed raw and never cleared.
     pub(super) fn therm_flags(therm_status: u64) -> u64 {
@@ -132,7 +142,8 @@ mod inner {
     /// APERF/MPERF/TSC sample of one logical CPU.
     #[derive(Debug, Clone, Copy)]
     pub(super) struct Counters {
-        pub tsc: u64,
+        /// Only read when the MPERF base clock is unknown.
+        pub tsc: Option<u64>,
         pub aperf: u64,
         pub mperf: u64,
         pub at: Instant,
@@ -160,13 +171,21 @@ mod inner {
         mperf_mhz: Option<f64>,
     ) -> Option<ClockStats> {
         let secs = cur.at.checked_duration_since(prev.at)?.as_secs_f64();
-        let d_tsc = cur.tsc.checked_sub(prev.tsc)?;
         let d_aperf = cur.aperf.checked_sub(prev.aperf)?;
         let d_mperf = cur.mperf.checked_sub(prev.mperf)?;
-        if secs <= 0.0 || d_tsc == 0 {
+        if secs <= 0.0 {
             return None;
         }
-        let ref_mhz = mperf_mhz.unwrap_or(d_tsc as f64 / secs / 1e6);
+        let ref_mhz = match mperf_mhz {
+            Some(mhz) => mhz,
+            None => {
+                let d_tsc = cur.tsc?.checked_sub(prev.tsc?)?;
+                if d_tsc == 0 {
+                    return None;
+                }
+                d_tsc as f64 / secs / 1e6
+            }
+        };
         let ref_ticks = ref_mhz * 1e6 * secs;
         Some(ClockStats {
             effective_mhz: d_aperf as f64 / secs / 1e6,
@@ -209,11 +228,17 @@ mod inner {
         prev: Option<Counters>,
     }
 
+    /// A configuration value read once at discovery and re-published each
+    /// poll: `(sensor, label, value, unit, category)`.
+    type FixedReading = (&'static str, &'static str, f64, SensorUnit, SensorCategory);
+
     struct PackageEntry {
         id: u32,
-        dev: MsrDevice,
+        /// Index into `IntelMsrSource::cpus` of the CPU used for package reads.
+        cpu_index: usize,
         /// Previous `(TSC, package C2 residency)` sample.
         prev_c2: Option<(u64, u64)>,
+        fixed: Vec<FixedReading>,
     }
 
     pub struct IntelMsrSource {
@@ -251,6 +276,7 @@ mod inner {
                 .map(|f| f.split_whitespace().collect())
                 .unwrap_or_default();
             let aperfmperf = flags.contains(&"aperfmperf");
+            let mperf_mhz = mperf_mhz();
 
             let online = sysfs::read_string_optional(Path::new("/sys/devices/system/cpu/online"))
                 .map(|s| sysfs::parse_cpulist(&s))
@@ -258,7 +284,7 @@ mod inner {
             let p_cores = read_cpulist("/sys/devices/cpu_core/cpus");
             let e_cores = read_cpulist("/sys/devices/cpu_atom/cpus");
 
-            let mut cpus = Vec::new();
+            let mut cpus: Vec<CpuEntry> = Vec::new();
             let mut packages: Vec<PackageEntry> = Vec::new();
             for cpu in online {
                 let Some(dev) = MsrDevice::open(cpu) else {
@@ -275,14 +301,12 @@ mod inner {
                     "/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id"
                 )))
                 .unwrap_or(0);
-                if !packages.iter().any(|p| p.id == pkg)
-                    && let Some(pkg_dev) = MsrDevice::open(cpu)
-                {
-                    let prev_c2 = read_pkg_c2(&pkg_dev);
+                if !packages.iter().any(|p| p.id == pkg) {
                     packages.push(PackageEntry {
                         id: pkg,
-                        dev: pkg_dev,
-                        prev_c2,
+                        cpu_index: cpus.len(),
+                        prev_c2: read_pkg_c2(&dev),
+                        fixed: read_fixed(&dev),
                     });
                 }
                 let mut entry = CpuEntry {
@@ -293,7 +317,7 @@ mod inner {
                 };
                 // Baseline now so the first poll already has a delta.
                 if aperfmperf {
-                    entry.prev = read_counters(&entry.dev);
+                    entry.prev = read_counters(&entry.dev, mperf_mhz.is_none());
                 }
                 cpus.push(entry);
             }
@@ -316,7 +340,7 @@ mod inner {
                 packages,
                 features,
                 aperfmperf,
-                mperf_mhz: mperf_mhz(),
+                mperf_mhz,
             }
         }
 
@@ -331,7 +355,8 @@ mod inner {
                 );
             }
             for pkg in &mut self.packages {
-                poll_package(pkg, self.features, &mut readings);
+                let dev = &self.cpus[pkg.cpu_index].dev;
+                poll_package(pkg, dev, self.features, &mut readings);
             }
             readings
         }
@@ -350,10 +375,70 @@ mod inner {
         ))
     }
 
-    fn read_counters(dev: &MsrDevice) -> Option<Counters> {
+    /// Package configuration registers, which do not change at runtime.
+    fn read_fixed(dev: &MsrDevice) -> Vec<FixedReading> {
+        let mut fixed: Vec<FixedReading> = Vec::new();
+        if let Some(target) = dev.read(msr::MSR_TEMPERATURE_TARGET)
+            && let Some(tj) = tjmax(target)
+        {
+            fixed.push((
+                "tjmax",
+                "TjMAX",
+                tj as f64,
+                SensorUnit::Celsius,
+                SensorCategory::Other,
+            ));
+            fixed.push((
+                "tcc_offset",
+                "TCC Offset",
+                tcc_offset(target) as f64,
+                SensorUnit::Celsius,
+                SensorCategory::Other,
+            ));
+        }
+        if let Some((min, max)) = dev
+            .read(msr::MSR_RING_RATIO_LIMIT)
+            .and_then(ring_ratio_limits)
+        {
+            fixed.push((
+                "ring_ratio_min",
+                "Ring Ratio Min",
+                min as f64,
+                SensorUnit::Unitless,
+                SensorCategory::Other,
+            ));
+            fixed.push((
+                "ring_ratio_max",
+                "Ring Ratio Max",
+                max as f64,
+                SensorUnit::Unitless,
+                SensorCategory::Other,
+            ));
+        }
+        if let Some(amps) = dev
+            .read(msr::MSR_VR_CURRENT_CONFIG)
+            .and_then(vr_current_limit_amps)
+        {
+            fixed.push((
+                "vr_current_limit",
+                "VR Current Limit",
+                amps,
+                SensorUnit::Amps,
+                SensorCategory::Current,
+            ));
+        }
+        fixed
+    }
+
+    fn read_counters(dev: &MsrDevice, with_tsc: bool) -> Option<Counters> {
         let at = Instant::now();
+        let tsc = if with_tsc {
+            Some(dev.read(msr::IA32_TIME_STAMP_COUNTER)?)
+        } else {
+            None
+        };
         Some(Counters {
-            tsc: dev.read(msr::IA32_TIME_STAMP_COUNTER)?,
+            tsc,
             aperf: dev.read(msr::IA32_APERF)?,
             mperf: dev.read(msr::IA32_MPERF)?,
             at,
@@ -372,7 +457,7 @@ mod inner {
         let prefix = &entry.prefix;
 
         if let Some(mperf_mhz) = aperfmperf
-            && let Some(cur) = read_counters(&entry.dev)
+            && let Some(cur) = read_counters(&entry.dev, mperf_mhz.is_none())
         {
             if let Some(stats) = entry
                 .prev
@@ -458,11 +543,12 @@ mod inner {
 
     fn poll_package(
         pkg: &mut PackageEntry,
+        dev: &MsrDevice,
         features: ModelFeatures,
         out: &mut Vec<(SensorId, SensorReading)>,
     ) {
         let chip = format!("package{}", pkg.id);
-        let c2_now = read_pkg_c2(&pkg.dev);
+        let c2_now = read_pkg_c2(dev);
         let c2_pct = pkg
             .prev_c2
             .zip(c2_now)
@@ -479,8 +565,12 @@ mod inner {
             ));
         };
 
+        for &(sensor, label, value, unit, category) in &pkg.fixed {
+            push(sensor, label, value, unit, category);
+        }
+
         if features.uncore_vid
-            && let Some(status) = pkg.dev.read(msr::MSR_UNCORE_PERF_STATUS)
+            && let Some(status) = dev.read(msr::MSR_UNCORE_PERF_STATUS)
         {
             if let Some(volts) = uncore_vid_volts(status) {
                 push(
@@ -502,27 +592,6 @@ mod inner {
             }
         }
 
-        if let Some((min, max)) = pkg
-            .dev
-            .read(msr::MSR_RING_RATIO_LIMIT)
-            .and_then(ring_ratio_limits)
-        {
-            push(
-                "ring_ratio_min",
-                "Ring Ratio Min",
-                min as f64,
-                SensorUnit::Unitless,
-                SensorCategory::Other,
-            );
-            push(
-                "ring_ratio_max",
-                "Ring Ratio Max",
-                max as f64,
-                SensorUnit::Unitless,
-                SensorCategory::Other,
-            );
-        }
-
         if let Some(pct) = c2_pct {
             push(
                 "c2_residency",
@@ -533,55 +602,20 @@ mod inner {
             );
         }
 
-        if let Some(target) = pkg.dev.read(msr::MSR_TEMPERATURE_TARGET)
-            && let Some(tj) = tjmax(target)
-        {
+        if let Some(status) = dev.read(msr::IA32_PACKAGE_THERM_STATUS) {
             push(
-                "tjmax",
-                "TjMAX",
-                tj as f64,
+                "tjmax_distance",
+                "Package Distance to TjMAX",
+                package_distance_to_tjmax(status) as f64,
                 SensorUnit::Celsius,
                 SensorCategory::Other,
             );
-            push(
-                "tcc_offset",
-                "TCC Offset",
-                tcc_offset(target) as f64,
-                SensorUnit::Celsius,
-                SensorCategory::Other,
-            );
-        }
-
-        if let Some(status) = pkg.dev.read(msr::IA32_PACKAGE_THERM_STATUS) {
-            if let Some(margin) = distance_to_tjmax(status) {
-                push(
-                    "tjmax_distance",
-                    "Package Distance to TjMAX",
-                    margin as f64,
-                    SensorUnit::Celsius,
-                    SensorCategory::Other,
-                );
-            }
             push(
                 "therm_status",
                 "Package Thermal Status",
                 therm_flags(status) as f64,
                 SensorUnit::Bitmask,
                 SensorCategory::Other,
-            );
-        }
-
-        if let Some(amps) = pkg
-            .dev
-            .read(msr::MSR_VR_CURRENT_CONFIG)
-            .and_then(vr_current_limit_amps)
-        {
-            push(
-                "vr_current_limit",
-                "VR Current Limit",
-                amps,
-                SensorUnit::Amps,
-                SensorCategory::Current,
             );
         }
 
@@ -602,7 +636,7 @@ mod inner {
                 "Ring Limit Reasons",
             ),
         ] {
-            if let Some(raw) = pkg.dev.read(addr) {
+            if let Some(raw) = dev.read(addr) {
                 // Bits 15:0 are live status, 31:16 sticky logs; shown raw.
                 push(
                     sensor,
@@ -706,6 +740,13 @@ mod tests {
     }
 
     #[test]
+    fn test_package_distance_has_no_valid_bit() {
+        // IA32_PACKAGE_THERM_STATUS recorded at idle: readout 0x42 = 66
+        assert_eq!(package_distance_to_tjmax(0x8842_0000), 66);
+        assert_eq!(package_distance_to_tjmax(0x0842_0000), 66);
+    }
+
+    #[test]
     fn test_distance_to_tjmax_requires_valid_bit() {
         // Core 0: readout 0x47 = 71 below TjMAX 105 -> 34 °C
         assert_eq!(distance_to_tjmax(0x8847_2000), Some(71));
@@ -748,7 +789,7 @@ mod tests {
     fn test_clock_stats() {
         let t0 = Instant::now();
         let prev = Counters {
-            tsc: 0,
+            tsc: Some(0),
             aperf: 0,
             mperf: 0,
             at: t0,
@@ -756,7 +797,7 @@ mod tests {
         // 1 s with MPERF at a 3700 MHz base and the TSC at 3686.4 MHz
         // (Arrow Lake); 25% in C0 at 5000 MHz
         let cur = Counters {
-            tsc: 3_686_400_000,
+            tsc: Some(3_686_400_000),
             aperf: 1_250_000_000,
             mperf: 925_000_000,
             at: t0 + Duration::from_secs(1),
@@ -768,7 +809,7 @@ mod tests {
 
         // Fully busy: busy clock equals effective clock
         let busy = Counters {
-            tsc: 3_686_400_000,
+            tsc: Some(3_686_400_000),
             aperf: 5_500_000_000,
             mperf: 3_700_000_000,
             at: t0 + Duration::from_secs(1),
@@ -782,13 +823,13 @@ mod tests {
     fn test_clock_stats_tsc_fallback() {
         let t0 = Instant::now();
         let prev = Counters {
-            tsc: 0,
+            tsc: Some(0),
             aperf: 0,
             mperf: 0,
             at: t0,
         };
         let cur = Counters {
-            tsc: 3_700_000_000,
+            tsc: Some(3_700_000_000),
             aperf: 1_250_000_000,
             mperf: 925_000_000,
             at: t0 + Duration::from_secs(1),
@@ -802,31 +843,41 @@ mod tests {
     fn test_clock_stats_rejects_backwards_counters() {
         let t0 = Instant::now();
         let prev = Counters {
-            tsc: 100,
+            tsc: Some(100),
             aperf: 100,
             mperf: 100,
             at: t0,
         };
-        let cur = Counters {
-            tsc: 50,
+        // TSC went backwards: only matters for the TSC fallback
+        let tsc_back = Counters {
+            tsc: Some(50),
             aperf: 200,
             mperf: 200,
             at: t0 + Duration::from_secs(1),
         };
-        assert!(clock_stats(&prev, &cur, Some(3700.0)).is_none());
+        assert!(clock_stats(&prev, &tsc_back, None).is_none());
+        assert!(clock_stats(&prev, &tsc_back, Some(3700.0)).is_some());
+        // APERF went backwards (hotplug, resume): always rejected
+        let aperf_back = Counters {
+            tsc: None,
+            aperf: 50,
+            mperf: 200,
+            at: t0 + Duration::from_secs(1),
+        };
+        assert!(clock_stats(&prev, &aperf_back, Some(3700.0)).is_none());
     }
 
     #[test]
     fn test_clock_stats_idle_has_no_busy_clock() {
         let t0 = Instant::now();
         let prev = Counters {
-            tsc: 0,
+            tsc: Some(0),
             aperf: 0,
             mperf: 0,
             at: t0,
         };
         let cur = Counters {
-            tsc: 1_000_000,
+            tsc: Some(1_000_000),
             aperf: 0,
             mperf: 0,
             at: t0 + Duration::from_millis(10),
