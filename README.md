@@ -105,8 +105,12 @@ sudo sio
 ### Real-time Sensor Monitoring (TUI)
 - **hwmon** -- all kernel-exported sensors: temperatures, fan speeds, voltages, power, current
 - **CPU** -- per-core frequency and utilization
+- **Intel MSR** (root or `CAP_SYS_RAWIO`) -- per-core effective and busy clock, C0 residency, ratio, requested core VID (Raptor Lake, Arrow Lake-S), distance to TjMAX and thermal flags; package uncore VID and ring ratio (Arrow Lake-S), TjMAX, package C2 residency, VR current limit, raw perf-limit-reason words. All reads are read-only and allowlisted
+- **Intel uncore** (root or `CAP_PERFMON`) -- measured ring/LLC (CNCU) and SNCU fabric clocks; DRAM read/write bandwidth on Arrow Lake-S
+- **Intel MCHBAR** (`--direct-io`, Arrow Lake-S) -- CPU/SoC BCLK, IA and GT temperatures, SA VID, PSF0 clock; trained DDR5 rate, gear, command rate and timings in `sio memory`
+- **Intel iGPU** -- render/media GT clock and RC6 residency (i915 and xe)
 - **GPU** -- temperature, fan speed, power draw, core/memory clocks, utilization, VRAM usage (NVIDIA via NVML, AMD via sysfs); Tegra integrated GPU frequency and load via devfreq
-- **RAPL** -- CPU package power consumption
+- **RAPL** -- CPU package power consumption, configured PL1/PL2/PL4 and base TDP
 - **Tegra** -- hardware engine clocks and state (APE, DLA, VIC, NVENC, etc.) on NVIDIA Jetson platforms
 - **Disk** -- per-device read/write throughput
 - **Network** -- per-interface RX/TX throughput
@@ -133,6 +137,10 @@ sudo sio
 | Key | Action |
 |-----|--------|
 | `q` / `Esc` | Quit (or clear active filter if one is set) |
+| `d` | Toggle dashboard / tree view |
+| `p` | CPU detail view (per-core clocks, VID, thermals, limits) |
+| `m` | DIMM detail view |
+| `t` | Cycle color theme |
 | `/` | Enter search/filter mode |
 | `Up` / `Down` / `j` / `k` | Navigate between groups |
 | `Enter` / `Space` | Toggle collapse/expand group |
@@ -161,7 +169,7 @@ sio has **zero mandatory runtime dependencies**. Everything is read from kernel 
 |-----------|----------------|---------|
 | NVIDIA driver | GPU name, VRAM, clocks, temp, power, utilization | `libnvidia-compute` (provides `libnvidia-ml.so.1`) |
 | `dmidecode` | Per-DIMM memory details (manufacturer, part number, timings) | `dmidecode` |
-| `msr` kernel module | CPU TDP, turbo ratios, C-states, perf limiters | `modprobe msr` |
+| `msr` kernel module | Intel per-core clocks, VID, thermal flags, limit reasons (CPU view) | `modprobe msr` |
 | `i2c-dev` kernel module | SPD/XMP memory timing data | `modprobe i2c-dev` |
 | `drivetemp` kernel module | SATA drive temperatures via hwmon | `modprobe drivetemp` |
 
@@ -172,7 +180,8 @@ sio runs without root and gracefully degrades:
 | Access Level | Available |
 |-------------|-----------|
 | **Non-root** | CPU info, hwmon sensors, GPU (NVML + sysfs), PCI/USB, network, disk basic info, DMI non-restricted fields |
-| **Root / sudo** | + Full DMI (serials, UUID), SMART data, NVMe health, MSR access, RAPL power, SPD timings |
+| **Root / sudo** | + Full DMI (serials, UUID), SMART data, NVMe health, MSR access, uncore perf counters, RAPL power, SPD timings |
+| **`--direct-io`** | + Super I/O registers, I2C SPD/PMBus, Intel MCHBAR (BCLK, IA/GT temps, trained memory timings) |
 
 Fields requiring elevation show `[requires root]` or are omitted.
 

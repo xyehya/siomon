@@ -57,6 +57,10 @@ sio reads directly from Linux kernel interfaces -- no lm-sensors or other usersp
 | PCI devices         | `/sys/bus/pci/devices/` + `pci.ids` (embedded) |
 | Sensors (hwmon)     | `/sys/class/hwmon/hwmon*/`                     |
 | Power (RAPL)        | `/sys/class/powercap/intel-rapl:*/`            |
+| Intel MSR telemetry | `/dev/cpu/N/msr` (read-only, allowlisted)      |
+| Intel uncore clocks | `perf_event_open` on `uncore_*` PMUs           |
+| Intel MCHBAR        | `/dev/mem` (read-only, `--direct-io`)          |
+| Intel iGPU          | `/sys/class/drm/card*/gt/` and `tile*/gt*/`    |
 | Disk throughput     | `/proc/diskstats`                              |
 | Network throughput  | `/sys/class/net/*/statistics/`                 |
 
@@ -102,7 +106,11 @@ src/
     cpu_freq.rs        -- Per-core frequency
     cpu_util.rs        -- Per-core utilization from /proc/stat deltas
     gpu_sensors.rs     -- NVML (persistent handle) + amdgpu hwmon polling
-    rapl.rs            -- RAPL energy counter -> watts
+    rapl.rs            -- RAPL energy counter -> watts, configured power limits
+    intel_msr.rs       -- Intel per-core clocks, VID, thermal flags, package MSRs
+    intel_uncore.rs    -- Intel uncore clocks and DRAM bandwidth (perf)
+    intel_mchbar.rs    -- Intel MCHBAR BCLK, IA/GT temps, SA status
+    intel_gpu.rs       -- Intel iGPU clocks and RC6 residency
     disk_activity.rs   -- /proc/diskstats -> MB/s
     network_stats.rs   -- Interface byte counters -> MB/s
     alerts.rs          -- Threshold-based sensor alerts with cooldown
@@ -115,7 +123,9 @@ src/
   platform/            -- Linux kernel interface abstraction
     sysfs.rs           -- Type-safe sysfs file readers
     procfs.rs          -- /proc/meminfo, /proc/cpuinfo parsers
-    msr.rs             -- /dev/cpu/N/msr access
+    msr.rs             -- read-only, allowlisted /dev/cpu/N/msr access
+    mchbar.rs          -- read-only, allowlisted Intel MCHBAR MMIO access
+    perf.rs            -- counting perf_event_open for uncore PMUs
     nvml.rs            -- NVML dlopen wrapper (18 functions)
     nvme_ioctl.rs      -- NVMe SMART/Health via admin command ioctl
 
